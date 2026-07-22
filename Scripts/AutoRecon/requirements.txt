@@ -1,0 +1,11 @@
+# AutoRecon runtime dependencies.
+#
+# The orchestrator itself uses only the Python standard library (asyncio,
+# tkinter, argparse, logging, ipaddress). Tkinter ships with CPython on most
+# platforms; on Debian/Kali install it with:  sudo apt-get install python3-tk
+#
+# The external recon tools it drives are NOT Python packages — install them
+# separately and put them on your PATH:
+#   subfinder, amass, assetfinder, findomain, gobuster, ffuf, nmap, masscan
+#
+# (No third-party pip packages are required to run AutoRecon.)

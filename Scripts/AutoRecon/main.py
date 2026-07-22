@@ -30,10 +30,10 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 
 # Scope enforcement / target validation (pure, testable, no network).
 # main.py is run as a script, so its own directory is on sys.path[0].
-from scope import Scope, load_scope, normalize_target, ScopeError
+from scope import load_scope, normalize_target, ScopeError
 from logsetup import get_job_logger
 import report as report_mod
-from report import RunManifest, StepResult, classify, STATUS_DRY_RUN, STATUS_SKIPPED
+from report import RunManifest, StepResult, classify, STATUS_DRY_RUN
 
 # ----------------------------
 # Configuration / Defaults
@@ -167,7 +167,7 @@ async def run_subprocess_async(cmd, cwd=None, timeout=DEFAULT_CMD_TIMEOUT):
 def safe_read_lines(path):
     try:
         with open(path, "r", errors="ignore") as f:
-            return [l.strip() for l in f if l.strip()]
+            return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
         return []
 
@@ -363,7 +363,7 @@ class JobRunner:
             if tool_name in self.overrides:
                 try:
                     workers = int(self.overrides[tool_name])
-                except:
+                except (ValueError, TypeError):
                     pass
             # minimum 1
             if workers < 1:
@@ -383,7 +383,7 @@ class JobRunner:
         self.log(f"[{tool_name}] CMD: {cmd}")
         started = datetime.now()
         if self.dry_run:
-            self.log(f"[DRY-RUN] Not executing (preview only).")
+            self.log("[DRY-RUN] Not executing (preview only).")
             self._record(StepResult(tool=tool_name, command=cmd, status=STATUS_DRY_RUN,
                                      started=started.isoformat(), host=host,
                                      finished=datetime.now().isoformat(), duration_s=0.0))
@@ -476,8 +476,8 @@ class JobRunner:
         async with sem:
             lines = await self._run_tool_cmd(cmd, str(out_path), tool)
         # add to discovered
-        for l in safe_read_lines(out_path):
-            self.discovered.add(l.strip())
+        for line in safe_read_lines(out_path):
+            self.discovered.add(line.strip())
         self.log(f"[+] After gobuster_dns discovered: {len(self.discovered)}")
         return lines
 
@@ -488,7 +488,6 @@ class JobRunner:
             return []
         sem = self.tool_semaphores.get(tool, asyncio.Semaphore(1))
         wordlist = step.get("wordlist") or DEFAULT_WORDLIST
-        workers = int(step.get("workers", 10))
         # this is CPU/light IO bound - we'll just run the generator synchronously inside semaphore
         async with sem:
             sources = sorted(self.discovered)[:1000]  # limit to first 1000 discovered subdomains to avoid explosion
@@ -660,7 +659,8 @@ class JobRunner:
             self.manifest.discovered = sorted(self.discovered)
             report_mod.write_json(self.manifest, self.base_dir / "run.json")
             report_mod.write_steps_csv(self.manifest.steps, self.base_dir / "steps.csv")
-            self.log(f"[+] Wrote run manifest: {self.base_dir / 'run.json'}")
+            report_mod.write_html(self.manifest, self.base_dir / "report.html")
+            self.log(f"[+] Wrote reports: run.json, steps.csv, report.html in {self.base_dir}")
         except Exception as e:
             self.log(f"[!] Failed writing run manifest: {e}")
 
@@ -815,7 +815,7 @@ class OrchestratorGUI:
                 t,w = p.split(":",1)
                 try:
                     out[t.strip()] = int(w.strip())
-                except:
+                except (ValueError, TypeError):
                     pass
         return out
 
@@ -948,7 +948,8 @@ class OrchestratorGUI:
     def open_results_dir(self):
         ensure_dir(RESULTS_DIR)
         # open file explorer - platform-specific
-        import webbrowser, sys
+        import webbrowser
+        import sys
         if sys.platform.startswith("linux"):
             subprocess.Popen(["xdg-open", str(RESULTS_DIR)])
         elif sys.platform.startswith("darwin"):
@@ -983,7 +984,6 @@ class OrchestratorGUI:
         runner = job.get("runner")
         if not runner:
             return
-        combined = runner.combined_file
         self.log_text.delete("1.0","end")
         self.log_text.insert("end", f"==== Logs for job {job_id} (target: {runner.target}) ====\n")
         # show files present in results dir
@@ -998,7 +998,7 @@ class OrchestratorGUI:
                 except Exception as e:
                     self.log_text.insert("end", f"[Could not read file: {e}]\n")
             else:
-                self.log_text.insert("end", f"[File too large to display or not readable]\n\n")
+                self.log_text.insert("end", "[File too large to display or not readable]\n\n")
         self.log_text.see("end")
 
 # ----------------------------
@@ -1085,7 +1085,7 @@ def main():
         sys.exit(run_headless(args))
 
     root = tk.Tk()
-    app = OrchestratorGUI(root)
+    OrchestratorGUI(root)
     root.mainloop()
 
 

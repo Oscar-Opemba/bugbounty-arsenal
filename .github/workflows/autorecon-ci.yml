@@ -1,0 +1,38 @@
+name: AutoRecon CI
+
+# Lints and tests the AutoRecon tool. Scoped to its own path so unrelated
+# archival scripts in this repo don't affect its status. All tests are pure /
+# dry-run: no network, no display, no external targets are ever touched.
+
+on:
+  push:
+    paths:
+      - "Scripts/AutoRecon/**"
+      - ".github/workflows/autorecon-ci.yml"
+  pull_request:
+    paths:
+      - "Scripts/AutoRecon/**"
+      - ".github/workflows/autorecon-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Scripts/AutoRecon
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      - name: Test (pytest)
+        run: python -m pytest -q
