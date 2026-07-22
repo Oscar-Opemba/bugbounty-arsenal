@@ -1,0 +1,37 @@
+name: RatFireWall CI
+
+# Lints and tests RatFireWall. Tests cover the pure rule engine and the Flask
+# response firewall (mitmproxy is not needed to run them).
+
+on:
+  push:
+    paths:
+      - "RatFireWall/**"
+      - ".github/workflows/ratfirewall-ci.yml"
+  pull_request:
+    paths:
+      - "RatFireWall/**"
+      - ".github/workflows/ratfirewall-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: RatFireWall
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      - name: Test (pytest)
+        run: python -m pytest -q

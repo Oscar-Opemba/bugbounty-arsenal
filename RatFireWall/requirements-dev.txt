@@ -1,0 +1,6 @@
+# Dev/CI deps. The rule-engine tests need nothing extra; the Horrid Flask test
+# imports Flask + requests. (mitmproxy is not needed to run the test suite.)
+pytest>=8.0
+ruff>=0.5
+Flask>=2.3
+requests>=2.31

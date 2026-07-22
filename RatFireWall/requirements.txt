@@ -1,0 +1,4 @@
+# RatFireWall runtime dependencies.
+mitmproxy>=10          # for firewall.py (the blocking proxy addon)
+Flask>=2.3             # for HorridAPIResponseFirewall/firewall.py
+requests>=2.31
