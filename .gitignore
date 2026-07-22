@@ -1,0 +1,50 @@
+# ---- OS / editor junk ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ---- Secrets & local config (never commit) ----
+.env
+.env.*
+*.pem
+*.key
+burp_cert.pem
+preferences.json
+last_session.json
+
+# ---- Tool session / state files ----
+# RatAPIChat and other tools persist request history that can contain
+# auth tokens, cookies, and target responses. Keep these local-only.
+**/last_session.json
+**/session.json
+
+# ---- Scan output (targets, findings, host lists) ----
+# Engagement data must not leak into version control.
+results/
+**/results/
+*_output.txt
+*_output.json
+ffuf_output.json
+report.html
+**/PREPOPLISTS/
+
+# ---- Scope files (contain real client / in-scope targets) ----
+# Commit only the *.example.txt templates, never a live scope file.
+scope.txt
+**/scope.txt
+!**/scope.example.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# ---- Go ----
+*.exe
+goScan
