@@ -31,6 +31,9 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 # Scope enforcement / target validation (pure, testable, no network).
 # main.py is run as a script, so its own directory is on sys.path[0].
 from scope import Scope, load_scope, normalize_target, ScopeError
+from logsetup import get_job_logger
+import report as report_mod
+from report import RunManifest, StepResult, classify, STATUS_DRY_RUN, STATUS_SKIPPED
 
 # ----------------------------
 # Configuration / Defaults
@@ -100,6 +103,10 @@ GLOBAL_MAX_CONCURRENCY = 10
 # Discovery can balloon into thousands of hosts; these keep active traffic sane.
 MAX_FFUF_HOSTS = 75
 MAX_PORTSCAN_HOSTS = 50
+# Retry policy for transient failures (e.g. passive-enum APIs rate-limiting or
+# a flaky resolver). A missing tool (rc 127) is never retried.
+DEFAULT_RETRIES = 2
+RETRY_BACKOFF_BASE = 3.0  # seconds; delay = base * 2**attempt
 
 # Permutation generator settings (internal simple permuter)
 PERMUTATION_SUFFIXES = ["dev", "test", "staging", "stage", "www", "beta", "old"]
@@ -279,9 +286,11 @@ class JobRunner:
         self.dry_run = dry_run
         self.cmd_timeout = cmd_timeout
         self.overrides = per_tool_overrides or {}
-        self.log = gui_log_callback or (lambda msg: print(f"[{job_id}] {msg}"))
         self.base_dir = RESULTS_DIR / f"{now_str()}_{job_id}"
         ensure_dir(self.base_dir)
+        # Structured logging: stdout + per-job file, plus an optional GUI sink.
+        self._gui_log = gui_log_callback
+        self.logger = get_job_logger(job_id, self.base_dir)
         self.tool_semaphores = {}  # tool -> asyncio.Semaphore based on workers
         # Global concurrency ceiling across ALL tools in this job.
         self.global_sem = asyncio.Semaphore(GLOBAL_MAX_CONCURRENCY)
@@ -290,6 +299,25 @@ class JobRunner:
         # internal sets
         self.discovered = set()
         self.combined_file = self.base_dir / "combined.txt"
+        # Structured run record (written as run.json + steps.csv at the end).
+        self.manifest = RunManifest(
+            job_id=job_id, target=self.target,
+            scope_source=getattr(scope, "source", "<memory>"),
+            workflow=workflow.get("name", "<unnamed>"),
+            dry_run=dry_run, started=datetime.now().isoformat(),
+        )
+
+    def log(self, msg):
+        """Emit a line to the structured logger and the optional GUI sink."""
+        self.logger.info(msg)
+        if self._gui_log:
+            try:
+                self._gui_log(msg)
+            except Exception:
+                pass
+
+    def _record(self, step: StepResult):
+        self.manifest.steps.append(step)
 
     def _in_scope(self, host):
         """True if *host* is in scope; logs and returns False otherwise."""
@@ -342,30 +370,62 @@ class JobRunner:
                 workers = 1
             self.tool_semaphores[tool_name] = asyncio.Semaphore(workers)
 
-    async def _run_tool_cmd(self, cmd, out_path=None, tool_name=None):
+    async def _run_tool_cmd(self, cmd, out_path=None, tool_name=None,
+                            retries=0, host=None):
         """
-        Run a single shell command, save stdout to out_path if provided, and log.
+        Run a single shell command, save stdout to out_path if provided, log,
+        and append a structured StepResult to the run manifest.
+
+        Retries: on a transient failure (non-zero rc that is NOT 127 "not
+        found") the command is retried up to *retries* times with exponential
+        backoff. A missing tool is never retried.
         """
         self.log(f"[{tool_name}] CMD: {cmd}")
+        started = datetime.now()
         if self.dry_run:
             self.log(f"[DRY-RUN] Not executing (preview only).")
+            self._record(StepResult(tool=tool_name, command=cmd, status=STATUS_DRY_RUN,
+                                     started=started.isoformat(), host=host,
+                                     finished=datetime.now().isoformat(), duration_s=0.0))
             return []
-        async with self.global_sem:
-            rc, out, err = await run_subprocess_async(cmd, timeout=self.cmd_timeout)
-        if rc == 124:
-            self.log(f"[!] {tool_name} timed out after {self.cmd_timeout}s and was killed.")
+
+        attempt = 0
+        rc, out, err = 127, "", ""
+        while True:
+            async with self.global_sem:
+                rc, out, err = await run_subprocess_async(cmd, timeout=self.cmd_timeout)
+            # Retry only transient failures (not a missing binary, not success).
+            if rc in (0, 127) or attempt >= retries:
+                break
+            delay = RETRY_BACKOFF_BASE * (2 ** attempt)
+            self.log(f"[{tool_name}] rc={rc}, retry {attempt + 1}/{retries} after {delay:.0f}s")
+            await asyncio.sleep(delay)
+            attempt += 1
+
+        finished = datetime.now()
         if out_path:
             try:
                 with open(out_path, "w", errors="ignore") as f:
                     f.write(out)
             except Exception as e:
                 self.log(f"[!] Failed saving output {out_path}: {e}")
-        if rc == 127:
-            self.log(f"[!] Tool not found or command failed: {err}")
+        if rc == 124:
+            self.log(f"[!] {tool_name} timed out after {self.cmd_timeout}s and was killed.")
+        elif rc == 127:
+            self.log(f"[!] Tool not found or command failed: {err.strip()[:200]}")
         elif rc != 0:
             self.log(f"[!] {tool_name} returned code {rc}. stderr: {err.strip()[:400]}")
         else:
-            self.log(f"[{tool_name}] finished, wrote {len(out.splitlines())} lines to {out_path if out_path else '<stdout>'}")
+            self.log(f"[{tool_name}] finished, wrote {len(out.splitlines())} lines to "
+                     f"{out_path if out_path else '<stdout>'}")
+
+        self._record(StepResult(
+            tool=tool_name, command=cmd, status=classify(rc), returncode=rc,
+            started=started.isoformat(), finished=finished.isoformat(),
+            duration_s=round((finished - started).total_seconds(), 2),
+            host=host, lines_out=len(out.splitlines()) if out else 0,
+            note=(err.strip()[:200] if rc not in (0,) else ""),
+        ))
         return out.splitlines() if out else []
 
     async def run_passive_tools(self):
@@ -385,7 +445,8 @@ class JobRunner:
                 # create coroutine wrapper to respect semaphore
                 async def run_with_sem(cmd=cmd, out_path=out_path, tool=tool, sem=sem):
                     async with sem:
-                        return await self._run_tool_cmd(cmd, str(out_path), tool)
+                        return await self._run_tool_cmd(cmd, str(out_path), tool,
+                                                        retries=DEFAULT_RETRIES)
                 tasks.append(run_with_sem())
         results = []
         if tasks:
@@ -441,6 +502,12 @@ class JobRunner:
             for p in generated:
                 self.discovered.add(p)
             self.log(f"[permutation] Generated {len(generated)} permutations, combined total now {len(self.discovered)}")
+            self._record(StepResult(
+                tool="permutation", command=f"(internal permuter, wordlist={wordlist})",
+                status="ok", returncode=0, lines_out=len(generated),
+                finished=datetime.now().isoformat(), duration_s=0.0,
+                note="local generation, no network traffic",
+            ))
             return generated
 
     async def run_ffuf_probe(self, step):
@@ -499,6 +566,7 @@ class JobRunner:
             nmap_template = DEFAULT_TOOLS.get("nmap", {}).get("cmd")
             if masscan_template:
                 out_path_m = self.base_dir / f"masscan_{host}.grep"
+                _t0 = datetime.now()
                 async with sem_m, self.global_sem:
                     cmd_m = masscan_template.format(host=host, output=str(out_path_m))
                     rc, out, err = await run_subprocess_async(cmd_m, timeout=self.cmd_timeout)
@@ -510,8 +578,14 @@ class JobRunner:
                         lines = safe_read_lines(out_path_m)
                         # if masscan found open ports we can feed to nmap; else fallback to nmap full
                         self.log(f"[masscan] {host} scan wrote {len(lines)} lines")
+                self._record(StepResult(
+                    tool="masscan", command=cmd_m, status=classify(rc), returncode=rc,
+                    started=_t0.isoformat(), finished=datetime.now().isoformat(),
+                    duration_s=round((datetime.now() - _t0).total_seconds(), 2), host=host,
+                    note=(err.strip()[:200] if rc not in (0,) else "")))
             # always run nmap (some hosts may not require masscan)
             out_path_n = self.base_dir / f"nmap_{host}"
+            _t1 = datetime.now()
             async with sem_n, self.global_sem:
                 cmd_n = nmap_template.format(output=str(out_path_n), host=host)
                 rc, out, err = await run_subprocess_async(cmd_n, timeout=self.cmd_timeout)
@@ -521,6 +595,11 @@ class JobRunner:
                     self.log(f"[nmap] {host} timed out after {self.cmd_timeout}s")
                 else:
                     self.log(f"[nmap] scanned {host} (rc={rc})")
+            self._record(StepResult(
+                tool="nmap", command=cmd_n, status=classify(rc), returncode=rc,
+                started=_t1.isoformat(), finished=datetime.now().isoformat(),
+                duration_s=round((datetime.now() - _t1).total_seconds(), 2), host=host,
+                note=(err.strip()[:200] if rc not in (0,) else "")))
         # run with concurrency limited by semaphores controlling masscan/nmap combined
         tasks = [scan_host(h) for h in hosts]
         if tasks:
@@ -571,6 +650,19 @@ class JobRunner:
             self.log(f"=== JOB {self.job_id} COMPLETE: {len(self.discovered)} unique subdomains. Results: {self.base_dir} ===")
         except Exception as e:
             self.log(f"[!!!] Job {self.job_id} failed: {e}")
+        finally:
+            self._finalize_manifest()
+
+    def _finalize_manifest(self):
+        """Write the structured run.json + steps.csv for this job."""
+        try:
+            self.manifest.finished = datetime.now().isoformat()
+            self.manifest.discovered = sorted(self.discovered)
+            report_mod.write_json(self.manifest, self.base_dir / "run.json")
+            report_mod.write_steps_csv(self.manifest.steps, self.base_dir / "steps.csv")
+            self.log(f"[+] Wrote run manifest: {self.base_dir / 'run.json'}")
+        except Exception as e:
+            self.log(f"[!] Failed writing run manifest: {e}")
 
 # ----------------------------
 # GUI
