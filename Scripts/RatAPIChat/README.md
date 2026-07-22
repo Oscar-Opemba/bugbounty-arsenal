@@ -1,167 +1,89 @@
+# RatAPIChat — API Request & Fuzzing Tool
 
-# 🐍 API Fuzzer GUI Tool
+A Tkinter GUI for crafting HTTP requests against an API — send single requests
+or throttled parameter-fuzzing runs, with Basic/Bearer/OAuth auth, a Burp proxy,
+Swagger/OpenAPI import, request history, and CSV export. Think "small Repeater +
+Intruder" with safe defaults.
 
-A Python-based GUI tool for sending customized HTTP requests with fuzzing capabilities. It supports Swagger/OpenAPI JSON import, Burp Suite integration, custom and pre-populated wordlists, session saving/loading, and more.
+> ## ⚠️ Authorized use only
+> This tool sends live HTTP requests (and, when fuzzing, many of them) to
+> whatever you point it at. Use it **only** against systems you are explicitly
+> authorized to test. See [`../../LEGAL.md`](../../LEGAL.md).
 
-<br>
+## Features
 
-## ✨ Features
+- Send `GET`/`POST`/`PUT`/`DELETE`/`PATCH` with Basic, Bearer, or OAuth 2.0 auth.
+- **Throttled fuzzing:** replace `FUZZ` in the body with each value from a list,
+  rate-limited (requests/sec) and gated by a confirmation showing the target
+  host, request count, and estimated duration.
+- Pre-populated fuzz lists from `./PREPOPLISTS/*.txt`.
+- Swagger/OpenAPI import to auto-fill endpoints and example bodies.
+- Burp Suite proxy + certificate support.
+- Request history, session save/load, CSV export.
 
-- ✅ GUI interface using `Tkinter`
-- ✅ Support for different authentication methods: Bearer, Basic, OAuth 2.0
-- ✅ Load and manage **pre-populated fuzz lists** from the `PREPOPLISTS/` directory
-- ✅ Swagger/OpenAPI JSON parser and endpoint loader
-- ✅ Request fuzzing with delay/rate limiting
-- ✅ History viewer with session save/load
-- ✅ Burp Suite proxy and certificate support
-- ✅ Export history to CSV
-- ✅ Import and parse Swagger/OpenAPI files
+## Safety & data handling
 
-<br>  
+- **Rate limiting actually works.** (In the original, a duplicate function
+  silently bypassed the throttle, so fuzzing fired as fast as the network
+  allowed — fixed.)
+- **Request timeout** (30s) so a slow/tarpitting host can't hang the UI.
+- **Secrets are not written to world-readable `/tmp`.** Session/preferences live
+  under `${XDG_CONFIG_HOME:-~/.config}/ratapichat/` with `0600` permissions, and
+  the auto-saved session **redacts auth tokens/passwords** by default. "Save
+  Session" asks before including secrets; those files are also `0600`.
+- **TLS verification stays on by default;** it only relaxes to a pinned Burp
+  certificate you explicitly import.
 
-## 📁 Folder Structure
-```
-
-├── main.py # Main GUI app
-├── PREPOPLISTS/         # Directory for pre-built wordlists
-│ ├── sqli.txt
-│ ├── xss.txt
-│ └── ...                # Add more .txt wordlists
-├── /tmp/
-│ ├── last_session.json  # Saved session history
-│ └── preferences.json   # Saved proxy/cert preferences
-
-```
-<br>
-
-## 🚀 Getting Started
-
-  
-
-### Prerequisites
-
-- Python 3.x
-- Required packages: `requests` , `tkinter`
-
-### Installation
-
-- To install the required dependencies using Python 3 and venv follow these steps:
+## Setup (under 5 commands)
 
 ```bash
-git clone --depth 1 https://github.com/The-XSS-Rat/SecurityTesting.git
-cd SecurityTesting/Scripts
-mv RatAPIChat ../../
-cd ../..
-rm -rf SecurityTesting
+sudo apt-get install -y python3-tk         # Tkinter (Debian/Kali)
+cd Scripts/RatAPIChat
+pip install -r requirements.txt            # just: requests
+python3 main.py
 ```
 
-- Set up a virtual environment:
-````bash
-python3 -m venv venv
-````
+## Usage
 
-### Activate the virtual environment:
+1. **Base URL** + **API Endpoint** (they're concatenated).
+2. Pick **Authentication** and enter the token/credentials.
+3. Choose **Method**, set **Content Type**, and fill the **Request Body**.
+4. **Send Request**, or put `FUZZ` in the body, add values under **Fuzz Values**
+   (or load a prepopulated list), set **Fuzz rate (req/sec)**, and
+   **Fuzz Parameters** → confirm the run.
+5. Optional: **Proxy URL** (e.g. `http://127.0.0.1:8080` for Burp) and
+   **File → Import Burp Cert** for HTTPS.
 
-- On macOS/Linux:
+## Testing
 
-````bash
-source venv/bin/activate
-````
+The fiddly logic (request building, rate limiting, URL splitting, redaction,
+Swagger parsing, secure persistence) is factored into `ratcore.py` and
+`session_store.py` and unit-tested with no network and no display:
 
-- On Windows:
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest -q     # 27 tests
+python3 -m ruff check .
+```
 
-````bash
-.\venv\Scripts\activate
-````
-- Install the required dependencies:
-````bash
-pip install -r requirements.txt
-````
-### Install library seperately
-
-- Installing `requests` (Python library for HTTP)
-````bash
-pip3 install requests
-
-````
-
-- Installing `tkinter` (GUI library)
-````bash
-sudo apt update
-sudo apt install python3-tk
-````
-
-<br>
-
-## 🧠 Usage 
-
-### 1. Set Up 
-
-- Enter **Base URL**, **Endpoint**, and select **Method** (GET, POST, etc.)
-- Choose content type: `JSON` or `Form URL Encoded`
-- Optionally input auth tokens, username/password (for Basic), or use OAuth 2.0
-
-### 2. Fuzzing
-
-- Either type custom fuzzing values in the fuzz box, or
-- Load from `PREPOPLISTS/` by selecting a list from the GUI
-- Press **"Fuzz"** to execute requests with each value
-
-### 3. Swagger Import
-
-- Click `Import Swagger` to load `.json` Swagger/OpenAPI
-- Pick an endpoint → auto-fills method, URL, and request body
- 
-### 4. Proxy (Burp Suite)
- 
-- Input proxy URL (e.g. `http://127.0.0.1:8080`)
-- Import Burp's certificate (PEM format) via GUI
- 
-### 5. Session & History
-
-- View request history in the side panel
-- Save/load session to/from `.json`
-- Export all request/response history as `.csv`
-
-<br>
-
-## 📂 Pre-Populated Wordlists
-
-Place `.txt` files in the `PREPOPLISTS/` folder. Each line should be a separate fuzzing value.
-
-Example:
-**xss.txt**
+## Architecture
 
 ```
-<script>alert(1)</script>
-"><svg/onload=alert(1)>
-'><img src=x onerror=alert(1)>
+main.py           Tkinter GUI + request/fuzz orchestration
+ratcore.py        pure logic: RateLimiter, build_request, split_url, redaction, swagger
+session_store.py  secure (0600, redacted) session/preferences persistence
+tests/            pytest suite (pure, no network/display)
+SQLiByAPISpec.py  separate helper (OpenAPI SQLi probe) — see note below
 ```
-<br>
 
-## 🧪 Sample Use Case
+**Flagged, not changed:** the GUI is still built from module-level globals, so
+`main.py` isn't importable for unit testing (its logic is covered via the
+extracted pure modules instead). Splitting the GUI into a class is a larger
+refactor deferred to keep this pass reviewable. `SQLiByAPISpec.py` is a separate
+tool in this folder with its own issues (unbounded threads, naive error-string
+detection); it was out of scope for this hardening pass.
 
-- Test for SQLi: load `sqli.txt` from PREPOPLISTS, click fuzz
-- Use `FUZZ` keyword in body/URL to dynamically inject each value
-- Monitor results and status codes for anomalies
+---
 
-<br>  
-
-## 🛠 Tech Stack
-
-- Python 3
-- `Tkinter` for GUI
-- `Requests` for HTTP handling
-- JSON for Swagger parsing and data exchange
- 
- <br>
- 
-## 🧑‍💻 Author
-
-Developed by **THE XSSRAT**
-
-<br>
-
-## 📜 License
-
-MIT License – feel free to use and modify with credit.
+_Original concept: The XSS Rat. Hardened for engagement use (working rate limit,
+secret-safe storage, request timeouts, tests, CI)._

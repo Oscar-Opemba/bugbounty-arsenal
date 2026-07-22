@@ -1,2 +1,5 @@
-requests
-tkinter
+# RatAPIChat runtime dependencies.
+requests>=2.31
+
+# Tkinter is part of the Python standard library, not a pip package. On
+# Debian/Kali install it with:  sudo apt-get install python3-tk

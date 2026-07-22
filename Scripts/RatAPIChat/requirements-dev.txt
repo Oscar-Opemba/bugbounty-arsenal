@@ -1,0 +1,4 @@
+# Development / CI dependencies for RatAPIChat.
+pytest>=8.0
+ruff>=0.5
+requests>=2.31
