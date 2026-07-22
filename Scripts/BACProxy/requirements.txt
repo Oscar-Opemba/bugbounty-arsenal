@@ -1,0 +1,4 @@
+# BACProxy runtime dependencies.
+mitmproxy>=10
+requests>=2.31
+PyYAML>=6.0

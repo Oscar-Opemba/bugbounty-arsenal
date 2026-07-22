@@ -1,0 +1,45 @@
+# BACProxy configuration (TEMPLATE)
+#
+# Copy this to config.yaml and edit for your engagement. config.yaml is
+# git-ignored so a live engagement's scope/tokens never get committed.
+
+# Only requests whose URL starts with one of these prefixes are tested.
+# Keep this tight — it is your authorization boundary.
+scope:
+  - "https://app.example.com/api/"
+
+# URL prefixes to never test (logout, billing, destructive endpoints, ...).
+exclude_endpoints:
+  - "https://app.example.com/api/logout"
+
+# HTTP methods that will be replayed as user2.
+# Default is idempotent/safe methods only. Adding POST/PUT/DELETE/PATCH means
+# BACProxy will REPEAT those actions as a second identity — potentially
+# duplicating destructive side effects. Only enable them deliberately.
+replay_methods:
+  - GET
+  - HEAD
+  - OPTIONS
+
+# The header swapped to impersonate the second user, and its value.
+# (Can also be set via env: USER2_HEADER_NAME / USER2_HEADER_VALUE.)
+user2_header_name: "Authorization"
+user2_header_value: "Bearer PUT-USER2-TOKEN-HERE"
+
+# Verify upstream TLS. Usually false when testing through a self-signed proxy
+# such as Burp; set true when replaying directly to a valid-cert host.
+verify_tls: false
+
+# Per-replay timeout (seconds).
+timeout: 30
+
+# Report output. The file may contain sensitive response data; it is written
+# owner-only (0600) and is git-ignored.
+output: "bac_report.html"
+
+# Truncate each stored response body to this many characters.
+max_body_chars: 2000
+
+# Best-effort masking of token/password-looking values in the report. Off by
+# default because confirming BAC usually requires seeing the actual response.
+redact: false

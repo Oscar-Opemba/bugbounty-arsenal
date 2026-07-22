@@ -30,7 +30,13 @@ results/
 *_output.json
 ffuf_output.json
 report.html
+bac_report.html
+**/bac_report.html
 **/PREPOPLISTS/
+
+# ---- Tool live config (contains scope / tokens; only *.example.* is tracked) ----
+config.yaml
+**/config.yaml
 
 # ---- Scope files (contain real client / in-scope targets) ----
 # Commit only the *.example.txt templates, never a live scope file.

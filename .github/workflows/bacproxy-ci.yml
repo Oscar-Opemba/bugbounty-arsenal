@@ -1,0 +1,37 @@
+name: BACProxy CI
+
+# Lints and tests BACProxy. Tests import only the pure core.py (no mitmproxy,
+# no network, no proxy).
+
+on:
+  push:
+    paths:
+      - "Scripts/BACProxy/**"
+      - ".github/workflows/bacproxy-ci.yml"
+  pull_request:
+    paths:
+      - "Scripts/BACProxy/**"
+      - ".github/workflows/bacproxy-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Scripts/BACProxy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      - name: Test (pytest)
+        run: python -m pytest -q

@@ -1,0 +1,6 @@
+# Development / CI dependencies for BACProxy.
+# Note: the test suite imports only core.py (pure), so mitmproxy is NOT required
+# to run the tests — just to run the addon itself.
+pytest>=8.0
+ruff>=0.5
+PyYAML>=6.0
