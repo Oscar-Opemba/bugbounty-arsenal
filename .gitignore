@@ -18,6 +18,9 @@ last_session.json
 # auth tokens, cookies, and target responses. Keep these local-only.
 **/last_session.json
 **/session.json
+# AutoRecon regenerates workflows.json from its built-in default on first run;
+# a user's saved workflows are local state, not shared config.
+**/workflows.json
 
 # ---- Scan output (targets, findings, host lists) ----
 # Engagement data must not leak into version control.

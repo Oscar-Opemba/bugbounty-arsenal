@@ -14,7 +14,9 @@ Author: The XSS Rat (style)
 """
 
 import os
+import sys
 import json
+import argparse
 import asyncio
 import threading
 import subprocess
@@ -25,6 +27,10 @@ from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
+
+# Scope enforcement / target validation (pure, testable, no network).
+# main.py is run as a script, so its own directory is on sys.path[0].
+from scope import Scope, load_scope, normalize_target, ScopeError
 
 # ----------------------------
 # Configuration / Defaults
@@ -64,17 +70,36 @@ DEFAULT_TOOLS = {
         "cmd": "ffuf -u http://{host}/FUZZ -w {wordlist} -t {threads} -mc 200 -s -o {output}",
         "default_workers": 10
     },
-    # nmap scan (full TCP ports with -Pn)
+    # nmap scan (full TCP ports with -Pn). Rate throttled for safety:
+    # --max-rate caps packets/sec so we don't behave like an accidental DoS
+    # against fragile hosts. Full port coverage (-p-) is preserved.
     "nmap": {
-        "cmd": "nmap -Pn -sV -p- --min-rate 1000 -oA {output} {host}",
+        "cmd": "nmap -Pn -sV -p- --max-rate 500 -oA {output} {host}",
         "default_workers": 1
     },
-    # masscan quick scan (optional, may require root)
+    # masscan quick scan (optional, may require root). Rate lowered from 1000
+    # to 300 pps by default; raise deliberately per-engagement if the target
+    # can take it. Full port range preserved.
     "masscan": {
-        "cmd": "masscan -p1-65535 {host} --rate 1000 -oG {output}",
+        "cmd": "masscan -p1-65535 {host} --rate 300 -oG {output}",
         "default_workers": 1
     }
 }
+
+# ----------------------------
+# Safety defaults (Phase 1 hardening)
+# ----------------------------
+# Per-command wall-clock timeout (seconds). Stops a slow / tarpitting / WAF-
+# blocked host from hanging a job forever. Set to 0 to disable (not advised).
+DEFAULT_CMD_TIMEOUT = 1800
+# Hard ceiling on concurrent external processes within a single job, regardless
+# of per-tool worker counts. This is the main guard against an over-aggressive
+# workflow turning into an accidental DoS.
+GLOBAL_MAX_CONCURRENCY = 10
+# Caps on how many discovered hosts a single job will actively probe / scan.
+# Discovery can balloon into thousands of hosts; these keep active traffic sane.
+MAX_FFUF_HOSTS = 75
+MAX_PORTSCAN_HOSTS = 50
 
 # Permutation generator settings (internal simple permuter)
 PERMUTATION_SUFFIXES = ["dev", "test", "staging", "stage", "www", "beta", "old"]
@@ -98,14 +123,39 @@ def run_subprocess_sync(cmd, cwd=None):
     except FileNotFoundError as e:
         return 127, "", str(e)
 
-async def run_subprocess_async(cmd, cwd=None):
-    """Run a command as asyncio subprocess and return (rc, stdout, stderr)."""
+async def run_subprocess_async(cmd, cwd=None, timeout=DEFAULT_CMD_TIMEOUT):
+    """
+    Run a command as an asyncio subprocess and return (rc, stdout, stderr).
+
+    Enforces a wall-clock timeout so an unreachable or deliberately slow target
+    cannot hang the job. On timeout the process is killed and rc 124 is returned
+    (matching GNU `timeout` convention). A missing tool surfaces as rc 127.
+    """
     try:
-        proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=cwd)
-        out, err = await proc.communicate()
-        return proc.returncode, (out.decode(errors="ignore") if out else ""), (err.decode(errors="ignore") if err else "")
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
     except FileNotFoundError as e:
         return 127, "", str(e)
+    try:
+        if timeout and timeout > 0:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        else:
+            out, err = await proc.communicate()
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.communicate()
+        except Exception:
+            pass
+        return 124, "", f"command timed out after {timeout}s"
+    return proc.returncode, (out.decode(errors="ignore") if out else ""), (err.decode(errors="ignore") if err else "")
 
 def safe_read_lines(path):
     try:
@@ -205,27 +255,76 @@ class JobRunner:
     Each job has its own directory in results and its own semaphores per tool based on workers.
     """
 
-    def __init__(self, job_id, target, workflow, per_tool_overrides=None, gui_log_callback=None):
+    def __init__(self, job_id, target, workflow, scope, per_tool_overrides=None,
+                 gui_log_callback=None, dry_run=False, cmd_timeout=DEFAULT_CMD_TIMEOUT):
         """
         :param job_id: unique id
-        :param target: domain
+        :param target: domain (will be normalized and scope-checked by the caller)
         :param workflow: workflow dict (with steps)
+        :param scope: Scope object; mandatory. Every host is checked against it
+                      before any command runs against that host.
         :param per_tool_overrides: dict tool->workers override
         :param gui_log_callback: function(msg) for GUI logging
+        :param dry_run: if True, no external command is executed — commands are
+                        logged only. Used for previewing a job with zero traffic.
+        :param cmd_timeout: per-command wall-clock timeout in seconds.
         """
+        if scope is None:
+            raise ValueError("JobRunner requires a Scope (safe-by-default)")
         self.job_id = job_id
-        self.target = target
+        # Normalize defensively; the caller is expected to have validated already.
+        self.target = normalize_target(target)
         self.workflow = workflow
+        self.scope = scope
+        self.dry_run = dry_run
+        self.cmd_timeout = cmd_timeout
         self.overrides = per_tool_overrides or {}
         self.log = gui_log_callback or (lambda msg: print(f"[{job_id}] {msg}"))
         self.base_dir = RESULTS_DIR / f"{now_str()}_{job_id}"
         ensure_dir(self.base_dir)
         self.tool_semaphores = {}  # tool -> asyncio.Semaphore based on workers
+        # Global concurrency ceiling across ALL tools in this job.
+        self.global_sem = asyncio.Semaphore(GLOBAL_MAX_CONCURRENCY)
         self._build_semaphores()
 
         # internal sets
         self.discovered = set()
         self.combined_file = self.base_dir / "combined.txt"
+
+    def _in_scope(self, host):
+        """True if *host* is in scope; logs and returns False otherwise."""
+        if self.scope.is_in_scope(host):
+            return True
+        self.log(f"[SCOPE-BLOCK] Skipping out-of-scope host: {host}")
+        return False
+
+    def _scoped_hosts(self, hosts):
+        """Filter a host list down to in-scope hosts (with logging)."""
+        hosts = list(hosts)
+        allowed = [h for h in hosts if self._in_scope(h)]
+        blocked = len(hosts) - len(allowed)
+        if blocked > 0:
+            self.log(f"[SCOPE] {blocked} host(s) filtered out as out-of-scope.")
+        return allowed
+
+    def plan_summary(self):
+        """Human-readable preview of exactly what this job will do (no traffic)."""
+        lines = [
+            f"Target      : {self.target}",
+            f"Scope file  : {self.scope.source}",
+            f"Dry-run     : {self.dry_run}",
+            f"Cmd timeout : {self.cmd_timeout}s",
+            f"Caps        : max_concurrency={GLOBAL_MAX_CONCURRENCY}, "
+            f"ffuf_hosts<={MAX_FFUF_HOSTS}, portscan_hosts<={MAX_PORTSCAN_HOSTS}",
+            "Enabled steps:",
+        ]
+        for step in self.workflow.get("steps", []):
+            if not step.get("enabled"):
+                continue
+            tool = step.get("tool")
+            tmpl = DEFAULT_TOOLS.get(tool, {}).get("cmd", "(internal step)")
+            lines.append(f"  - {tool:<13} {tmpl}")
+        return "\n".join(lines)
 
     def _build_semaphores(self):
         # per-step workers
@@ -248,7 +347,13 @@ class JobRunner:
         Run a single shell command, save stdout to out_path if provided, and log.
         """
         self.log(f"[{tool_name}] CMD: {cmd}")
-        rc, out, err = await run_subprocess_async(cmd)
+        if self.dry_run:
+            self.log(f"[DRY-RUN] Not executing (preview only).")
+            return []
+        async with self.global_sem:
+            rc, out, err = await run_subprocess_async(cmd, timeout=self.cmd_timeout)
+        if rc == 124:
+            self.log(f"[!] {tool_name} timed out after {self.cmd_timeout}s and was killed.")
         if out_path:
             try:
                 with open(out_path, "w", errors="ignore") as f:
@@ -350,11 +455,10 @@ class JobRunner:
         ffuf_wordlist = step.get("wordlist") or DEFAULT_WORDLIST
         threads = int(step.get("workers", 10))
         template = DEFAULT_TOOLS.get(tool, {}).get("cmd", "")
-        # choose hosts to probe - dedupe, maybe only hostnames with www or base name
-        hosts = sorted(self.discovered)
-        # limit probes per job to avoid overloading
-        hosts = hosts[:200]
-        self.log(f"[ffuf] Probing {len(hosts)} hosts with ffuf (wordlist={ffuf_wordlist})")
+        # choose hosts to probe - dedupe, then enforce scope, then cap volume
+        hosts = self._scoped_hosts(sorted(self.discovered))
+        hosts = hosts[:MAX_FFUF_HOSTS]
+        self.log(f"[ffuf] Probing {len(hosts)} in-scope hosts with ffuf (cap={MAX_FFUF_HOSTS}, wordlist={ffuf_wordlist})")
         async def run_ffuf_on_host(host):
             async with sem:
                 output_name = self.base_dir / f"ffuf_{host.replace('/','_').replace(':','_')}.json"
@@ -377,32 +481,44 @@ class JobRunner:
         workers_m = int(next((s for s in self.workflow.get("steps", []) if s.get("tool")==tool_m), {}).get("workers", 1) or 1)
         workers_n = int(next((s for s in self.workflow.get("steps", []) if s.get("tool")==tool_n), {}).get("workers", 1) or 1)
 
-        # hosts to scan - limit and dedupe
-        hosts = sorted(self.discovered)[:100]
-        self.log(f"[portscan] Scanning {len(hosts)} hosts (masscan workers={workers_m}, nmap workers={workers_n})")
+        # hosts to scan - dedupe, enforce scope, then cap volume
+        hosts = self._scoped_hosts(sorted(self.discovered))
+        hosts = hosts[:MAX_PORTSCAN_HOSTS]
+        self.log(f"[portscan] Scanning {len(hosts)} in-scope hosts (cap={MAX_PORTSCAN_HOSTS}, "
+                 f"masscan workers={workers_m}, nmap workers={workers_n})")
 
         async def scan_host(host):
+            # Defence in depth: re-check scope right before firing at this host.
+            if not self._in_scope(host):
+                return
+            if self.dry_run:
+                self.log(f"[DRY-RUN] Would portscan {host} (masscan/nmap)")
+                return
             # attempt masscan quickly (if available)
             masscan_template = DEFAULT_TOOLS.get("masscan", {}).get("cmd")
             nmap_template = DEFAULT_TOOLS.get("nmap", {}).get("cmd")
             if masscan_template:
                 out_path_m = self.base_dir / f"masscan_{host}.grep"
-                async with sem_m:
+                async with sem_m, self.global_sem:
                     cmd_m = masscan_template.format(host=host, output=str(out_path_m))
-                    rc, out, err = await run_subprocess_async(cmd_m)
+                    rc, out, err = await run_subprocess_async(cmd_m, timeout=self.cmd_timeout)
                     if rc == 127:
                         self.log("[masscan] not installed or failed, skipping masscan")
+                    elif rc == 124:
+                        self.log(f"[masscan] {host} timed out after {self.cmd_timeout}s")
                     elif rc == 0 and os.path.exists(out_path_m):
                         lines = safe_read_lines(out_path_m)
                         # if masscan found open ports we can feed to nmap; else fallback to nmap full
                         self.log(f"[masscan] {host} scan wrote {len(lines)} lines")
             # always run nmap (some hosts may not require masscan)
             out_path_n = self.base_dir / f"nmap_{host}"
-            async with sem_n:
+            async with sem_n, self.global_sem:
                 cmd_n = nmap_template.format(output=str(out_path_n), host=host)
-                rc, out, err = await run_subprocess_async(cmd_n)
+                rc, out, err = await run_subprocess_async(cmd_n, timeout=self.cmd_timeout)
                 if rc == 127:
                     self.log("[nmap] not installed or failed")
+                elif rc == 124:
+                    self.log(f"[nmap] {host} timed out after {self.cmd_timeout}s")
                 else:
                     self.log(f"[nmap] scanned {host} (rc={rc})")
         # run with concurrency limited by semaphores controlling masscan/nmap combined
@@ -499,6 +615,16 @@ class OrchestratorGUI:
         self.overrides_entry = ttk.Entry(mid)
         self.overrides_entry.grid(row=3, column=0, columnspan=4, sticky="ew", padx=4)
 
+        # scope file (REQUIRED — no job runs without it)
+        ttk.Label(mid, text="Scope file (required):").grid(row=4, column=0, sticky="w")
+        self.scope_entry = ttk.Entry(mid)
+        self.scope_entry.grid(row=4, column=1, columnspan=2, sticky="ew", padx=4)
+        ttk.Button(mid, text="Browse...", command=self.browse_scope).grid(row=4, column=3, padx=4)
+        # default to a scope.txt next to this script if present
+        default_scope = APP_DIR / "scope.txt"
+        if default_scope.exists():
+            self.scope_entry.insert(0, str(default_scope))
+
         # job control buttons
         controls = ttk.Frame(self.root)
         controls.pack(fill="x", padx=6, pady=6)
@@ -506,6 +632,10 @@ class OrchestratorGUI:
         ttk.Button(controls, text="Start Multiple Jobs (batch from file)", command=self.start_jobs_from_file).pack(side="left", padx=4)
         ttk.Button(controls, text="Stop Selected Job", command=self.stop_selected_job).pack(side="left", padx=4)
         ttk.Button(controls, text="Open Results Dir", command=self.open_results_dir).pack(side="left", padx=4)
+        # Dry-run defaults ON: safe-by-default, sends zero traffic until unchecked.
+        self.dry_run_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(controls, text="Dry run (preview only, no traffic)",
+                        variable=self.dry_run_var).pack(side="left", padx=12)
 
         # bottom: job list and logs
         bottom = ttk.PanedWindow(self.root, orient="horizontal")
@@ -597,11 +727,51 @@ class OrchestratorGUI:
                     pass
         return out
 
+    def browse_scope(self):
+        path = filedialog.askopenfilename(
+            title="Select scope file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if path:
+            self.scope_entry.delete(0, "end")
+            self.scope_entry.insert(0, path)
+
     def start_job(self):
         target = self.target_entry.get().strip()
         if not target:
             messagebox.showerror("Error", "Enter a target domain")
             return
+
+        # --- Scope is mandatory (safe-by-default) ---
+        scope_path = self.scope_entry.get().strip()
+        if not scope_path:
+            messagebox.showerror(
+                "Scope required",
+                "A scope file is required before any job can run.\n\n"
+                "Copy scope.example.txt to scope.txt, add your authorized "
+                "targets, and select it here.",
+            )
+            return
+        try:
+            scope = load_scope(scope_path)
+        except ScopeError as e:
+            messagebox.showerror("Invalid scope file", str(e))
+            return
+
+        # --- Validate + normalize the target, and confirm it is in scope ---
+        try:
+            target = normalize_target(target)
+        except ValueError as e:
+            messagebox.showerror("Invalid target", f"{e}")
+            return
+        if not scope.is_in_scope(target):
+            messagebox.showerror(
+                "Target out of scope",
+                f"Target '{target}' does not match any include rule in\n"
+                f"{scope.source}.\n\nRefusing to run.",
+            )
+            return
+
         workflow_name = self.workflow_combo.get()
         if workflow_name not in self.workflows:
             messagebox.showerror("Error", "Select a valid workflow")
@@ -609,8 +779,23 @@ class OrchestratorGUI:
         workflow = self.workflows[workflow_name]
         job_id = (self.jobname_entry.get().strip() or f"job_{uuid.uuid4().hex[:6]}")
         overrides = self.parse_overrides(self.overrides_entry.get().strip())
+        dry_run = bool(self.dry_run_var.get())
         # create runner
-        job_runner = JobRunner(job_id=job_id, target=target, workflow=workflow, per_tool_overrides=overrides, gui_log_callback=lambda m, jid=job_id: self.job_log(jid,m))
+        job_runner = JobRunner(job_id=job_id, target=target, workflow=workflow, scope=scope,
+                               per_tool_overrides=overrides, dry_run=dry_run,
+                               gui_log_callback=lambda m, jid=job_id: self.job_log(jid, m))
+
+        # --- Explicit confirmation before sending any live traffic ---
+        if not dry_run:
+            proceed = messagebox.askokcancel(
+                "Confirm LIVE run",
+                job_runner.plan_summary()
+                + "\n\nThis will send LIVE traffic to the target above.\nProceed?",
+                icon="warning",
+            )
+            if not proceed:
+                self.log(f"[i] Job for {target} cancelled by user at confirmation.")
+                return
         # create asyncio thread to run pipeline (wrap in thread to not block)
         def run_in_thread(runner: JobRunner):
             asyncio.run(runner.run_pipeline())
@@ -725,16 +910,92 @@ class OrchestratorGUI:
         self.log_text.see("end")
 
 # ----------------------------
+# CLI (headless) entrypoint
+# ----------------------------
+def build_arg_parser():
+    p = argparse.ArgumentParser(
+        prog="autorecon",
+        description="AutoRecon — subdomain recon orchestrator (GUI by default; "
+                    "headless with --target/--scope).",
+    )
+    p.add_argument("--target", help="Target apex domain or host (headless mode).")
+    p.add_argument("--scope", help="Path to scope file. REQUIRED to run a job.")
+    p.add_argument("--workflow", default="default_basic",
+                   help="Workflow name from workflows.json (default: default_basic).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Preview the plan and resolved commands without sending any traffic.")
+    p.add_argument("--no-gui", action="store_true",
+                   help="Force headless mode (requires --target and --scope).")
+    p.add_argument("--cmd-timeout", type=int, default=DEFAULT_CMD_TIMEOUT,
+                   help=f"Per-command timeout in seconds (default: {DEFAULT_CMD_TIMEOUT}).")
+    p.add_argument("--yes", action="store_true",
+                   help="Skip the interactive live-run confirmation (use with care).")
+    return p
+
+
+def run_headless(args):
+    """Run a single job without the GUI. Returns a process exit code."""
+    try:
+        scope = load_scope(args.scope)
+    except ScopeError as e:
+        print(f"[SCOPE] {e}", file=sys.stderr)
+        return 2
+    try:
+        target = normalize_target(args.target)
+    except ValueError as e:
+        print(f"[TARGET] invalid target: {e}", file=sys.stderr)
+        return 2
+    if not scope.is_in_scope(target):
+        print(f"[SCOPE] Refusing: target '{target}' is not in scope ({scope.source}).",
+              file=sys.stderr)
+        return 2
+
+    workflows = load_workflows() or {"default_basic": DEFAULT_WORKFLOW}
+    workflow = workflows.get(args.workflow)
+    if workflow is None:
+        print(f"[WORKFLOW] unknown workflow '{args.workflow}'. "
+              f"Available: {', '.join(workflows)}", file=sys.stderr)
+        return 2
+
+    job_id = f"cli_{uuid.uuid4().hex[:6]}"
+    runner = JobRunner(job_id=job_id, target=target, workflow=workflow, scope=scope,
+                       dry_run=args.dry_run, cmd_timeout=args.cmd_timeout)
+    print(runner.plan_summary())
+
+    if not args.dry_run and not args.yes:
+        try:
+            resp = input("\nSend LIVE traffic to the target above? [y/N] ").strip().lower()
+        except EOFError:
+            resp = "n"
+        if resp != "y":
+            print("Aborted (no confirmation).")
+            return 1
+
+    asyncio.run(runner.run_pipeline())
+    return 0
+
+
+# ----------------------------
 # Main
 # ----------------------------
 def main():
+    args = build_arg_parser().parse_args()
     ensure_dir(RESULTS_DIR)
     # ensure workflows file exists
-    wfs = load_workflows()
-    if not wfs:
+    if not load_workflows():
         save_workflows({"default_basic": DEFAULT_WORKFLOW})
+
+    # Headless if explicitly requested or a target was given on the CLI.
+    if args.no_gui or args.target:
+        if not args.target or not args.scope:
+            print("Headless mode requires both --target and --scope.", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(run_headless(args))
+
     root = tk.Tk()
     app = OrchestratorGUI(root)
     root.mainloop()
 
+
 if __name__ == "__main__":
+    main()

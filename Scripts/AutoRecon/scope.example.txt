@@ -1,0 +1,20 @@
+# AutoRecon scope file (TEMPLATE)
+#
+# Copy this to `scope.txt` and edit it for each engagement.
+# `scope.txt` is git-ignored so a real engagement's targets never get committed.
+#
+# Rules (one per line, '#' starts a comment):
+#   example.com          -> the apex AND every subdomain (*.example.com)
+#   .example.com         -> same as above (leading-dot form)
+#   app.example.com      -> this host and its subdomains only
+#   !test.example.com    -> EXCLUSION: never in scope, even if a rule above matches
+#   203.0.113.10         -> a single IP
+#   203.0.113.0/24       -> a CIDR range
+#
+# Matching is case-insensitive. Exclusions always win. A job will refuse to run
+# if the target — or any discovered/permuted host it is about to probe — does
+# not match an include rule here.
+
+# ---- Replace everything below with YOUR authorized scope ----
+example.com
+!internal.example.com
