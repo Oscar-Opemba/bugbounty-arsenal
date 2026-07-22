@@ -57,3 +57,5 @@ env/
 # ---- Go ----
 *.exe
 goScan
+goscan
+Scripts/goScan/goscan

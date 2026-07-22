@@ -1,0 +1,37 @@
+name: goScan CI
+
+on:
+  push:
+    paths:
+      - "Scripts/goScan/**"
+      - ".github/workflows/goscan-ci.yml"
+  pull_request:
+    paths:
+      - "Scripts/goScan/**"
+      - ".github/workflows/goscan-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  build-vet-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Scripts/goScan
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      - name: go build
+        run: go build -o /dev/null ./...
