@@ -55,7 +55,9 @@ env/
 .ruff_cache/
 
 # ---- Go ----
+# Ignore compiled binaries only (leading slash / explicit path so these do NOT
+# match the Scripts/goScan/ source directory).
 *.exe
-goScan
-goscan
+/goScan
+/goscan
 Scripts/goScan/goscan
