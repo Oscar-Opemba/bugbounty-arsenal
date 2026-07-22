@@ -72,16 +72,20 @@ python3 -m ruff check .
 main.py           Tkinter GUI + request/fuzz orchestration
 ratcore.py        pure logic: RateLimiter, build_request, split_url, redaction, swagger
 session_store.py  secure (0600, redacted) session/preferences persistence
+SQLiByAPISpec.py  OpenAPI-driven SQLi probe GUI (bounded pool, signature detection)
+sqli_core.py      pure logic for the SQLi probe (payloads, URL build, error signatures)
 tests/            pytest suite (pure, no network/display)
-SQLiByAPISpec.py  separate helper (OpenAPI SQLi probe) — see note below
 ```
 
-**Flagged, not changed:** the GUI is still built from module-level globals, so
-`main.py` isn't importable for unit testing (its logic is covered via the
-extracted pure modules instead). Splitting the GUI into a class is a larger
-refactor deferred to keep this pass reviewable. `SQLiByAPISpec.py` is a separate
-tool in this folder with its own issues (unbounded threads, naive error-string
-detection); it was out of scope for this hardening pass.
+The SQLi probe (`SQLiByAPISpec.py`) is also hardened: bounded worker pool
+(was one unbounded thread per endpoint), thread-safe GUI updates via a queue,
+request timeouts, a confirmation gate, and DBMS-signature-based detection instead
+of the old `"error" in body` check. Its pure logic lives in `sqli_core.py`.
+
+**Flagged, not changed:** both GUIs are built from module-level globals, so
+`main.py` / `SQLiByAPISpec.py` aren't importable for unit testing (their logic is
+covered via the extracted pure modules instead). Splitting the GUIs into classes
+is a larger refactor deferred to keep this pass reviewable.
 
 ---
 
